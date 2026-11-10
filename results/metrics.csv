@@ -1,0 +1,3 @@
+model,precision,recall,f1,true_negatives,false_positives,false_negatives,true_positives
+Naive Bayes (baseline),0.984104,0.968141,0.976057,7713,134,273,8296
+Logistic regression,0.982856,0.990197,0.986513,7699,148,84,8485

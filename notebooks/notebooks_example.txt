@@ -1,0 +1,25 @@
+What goes in the notebooks folder?
+
+We will put our Jupyter notebook 01_data_exploration.ipynb here.
+A notebook is a file that ends in .ipynb. It has small blocks called
+cells. Some cells contain Python code. Others contain notes. When we
+run a code cell, its result appears below it as a table or a chart.
+
+Why do we use a notebook?
+
+Our notebook will help us understand the data and explain our work.
+It will open data/phishing_email.csv and count the two classes.
+A chart will show how many emails are legitimate and how many are
+spam or phishing.
+
+We will also check how many rows have missing text or repeated messages.
+This helps us explain why the training script cleans the data.
+
+How will we show the model results?
+
+Our notebook will open results/metrics.csv and make a chart of the scores.
+This will show the differences between Naive Bayes and logistic
+regression. We will add short notes to explain what the scores mean.
+
+The model comparison runs through train.py. Our notebook will show
+the data checks and model results with tables, charts and notes.

@@ -1,0 +1,53 @@
+What goes in the models folder?
+
+We train two models
+
+When we run train.py, it trains two email models in the computer's memory.
+The first uses Naive Bayes. The second uses logistic regression.
+Both use TF-IDF to turn email text into numbers. We compare their scores
+to help us choose a model for the API.
+
+Why do we save a model file?
+
+The scores go in results/metrics.csv. A saved model file keeps the model
+available after the script ends. We will save the chosen pipeline in
+this folder. The file holds what TF-IDF and the classifier learned
+during training. We call these two steps together a pipeline.
+
+What is TF-IDF?
+
+TF-IDF stands for Term Frequency and Inverse Document Frequency.
+It gives words a score. A word can get a higher score if it appears
+often in one email but only in a few other emails. Common words usually
+get less weight. The classifier uses these numbers to find patterns.
+
+What is joblib and why do we use it?
+
+Joblib is a Python library that can save and load trained models.
+It lets us keep TF-IDF and the classifier together in one file.
+When we load the file, the pipeline is ready to use again.
+
+How do we save and load the file?
+
+After training, we will save the chosen pipeline like this.
+
+    import joblib
+    joblib.dump(pipeline, "models/phishing_pipeline.joblib")
+
+When FastAPI starts, it will read the file like this.
+
+    import joblib
+    pipeline = joblib.load("models/phishing_pipeline.joblib")
+
+These example paths start from the main project folder. Loading means
+reading a file on the computer where FastAPI runs. If the API runs on
+another computer, we first copy the model file there.
+
+How does the API use the model?
+
+A user sends email text to /predict. FastAPI passes the text to the
+loaded pipeline. TF-IDF turns the text into numbers. The classifier
+returns 0 for legitimate email or 1 for spam or phishing.
+
+The current train.py creates the model comparison. The save and load
+examples show how we will connect the chosen model to the API.
