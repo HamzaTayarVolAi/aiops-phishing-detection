@@ -1,5 +1,3 @@
-"""Train and compare two email classifiers on the same held-out data."""
-
 import argparse
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,11 +16,11 @@ METRICS_PATH = ROOT / "results" / "metrics.csv"
 BASELINE_METRICS_PATH = ROOT / "results" / "baseline_metrics.csv"
 TEXT = "text_combined"
 LABEL = "label"
-TEST_SIZE = 0.20
+TEST_SIZE = 0.20  # 20% for testing, 80% for training
 SEED = 42
 
 
-def load_dataset(path: Path) -> tuple[pd.DataFrame, pd.Series]:
+def load_dataset(path: Path):
     """Load the combined Kaggle CSV and remove missing or ambiguous examples."""
     if not path.is_file():
         raise FileNotFoundError(
@@ -52,7 +50,7 @@ def load_dataset(path: Path) -> tuple[pd.DataFrame, pd.Series]:
         {
             "Rows read": len(raw),
             "Removed for missing text or label": len(raw) - len(present),
-            "Removed for conflicting labels": int(conflicting.sum()),
+            "Removed for conflicting labels": conflicting.sum(),
             "Removed as duplicate text": len(unambiguous) - len(cleaned),
             "Rows after cleaning": len(cleaned),
         }
@@ -60,9 +58,7 @@ def load_dataset(path: Path) -> tuple[pd.DataFrame, pd.Series]:
     return cleaned, audit
 
 
-def split_dataset(
-    emails: pd.DataFrame,
-) -> tuple[tuple[pd.Series, pd.Series, pd.Series, pd.Series], pd.DataFrame]:
+def split_dataset(emails: pd.DataFrame):
     """Create a reproducible split and count each class in both parts."""
     text_train, text_test, label_train, label_test = train_test_split(
         emails[TEXT],
@@ -86,14 +82,12 @@ def split_dataset(
     return (text_train, text_test, label_train, label_test), split_counts
 
 
-def compare_models(
-    emails: pd.DataFrame, *, baseline_only: bool = False
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def compare_models(emails: pd.DataFrame, *, baseline_only: bool = False):
     """Evaluate the baseline and optionally the second classifier on the same split."""
     split, split_counts = split_dataset(emails)
     text_train, text_test, label_train, label_test = split
 
-    classifiers: dict[str, MultinomialNB | LogisticRegression] = {
+    classifiers = {
         "Naive Bayes (baseline)": MultinomialNB(),
     }
     if not baseline_only:
@@ -126,8 +120,8 @@ def compare_models(
     return split_counts, pd.DataFrame(rows)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main():
+    parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, default=DATA_PATH, help="Path to phishing_email.csv.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -141,7 +135,6 @@ def main() -> None:
     if args.data.resolve() == metrics_path.resolve():
         parser.error(f"Choose a data file other than {metrics_path.relative_to(ROOT)}.")
 
-    metrics = None
     try:
         emails, audit = load_dataset(args.data)
         if args.split_only:
@@ -160,11 +153,9 @@ def main() -> None:
     print(audit.to_string())
     print(f"\nStratified 80/20 split (seed {SEED})")
     print(split_counts.to_string())
-    if metrics is not None:
-        if args.baseline_only:
-            print("\nBaseline on the test split")
-        else:
-            print("\nModel comparison on the test split")
+    if not args.split_only:
+        title = "Baseline" if args.baseline_only else "Model comparison"
+        print(f"\n{title} on the test split")
         print(metrics.round(4).to_string(index=False))
         print(f"\nMetrics saved to {metrics_path.relative_to(ROOT)}")
 
