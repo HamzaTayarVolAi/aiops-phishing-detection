@@ -1,2 +1,6 @@
 pandas==2.2.3
 scikit-learn==1.8.0
+mlflow==3.18.0
+
+python -m pip install "mlflow>=3,<4"
+python -m pip freeze | Select-String '^mlflow=='
