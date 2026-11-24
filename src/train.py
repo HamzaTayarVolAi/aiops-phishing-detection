@@ -22,6 +22,8 @@ TEXT = "text_combined"
 LABEL = "label"
 TEST_SIZE = 0.20
 SEED = 42
+TFIDF_MIN_DF = 2
+TFIDF_MAX_FEATURES = 30_000
 EXPERIMENT_NAME = "Spam and Phishing Email Detection"
 
 
@@ -95,73 +97,94 @@ def split_dataset(emails: pd.DataFrame):
     return (text_train, text_test, label_train, label_test), split_counts
 
 
+def train_naive_bayes(text_train, label_train):
+    """Fit the TF-IDF and multinomial Naive Bayes pipeline on training data."""
+    model = make_pipeline(
+        TfidfVectorizer(min_df=TFIDF_MIN_DF, max_features=TFIDF_MAX_FEATURES),
+        MultinomialNB(),
+    )
+    return model.fit(text_train, label_train)
+
+
+def train_logistic_regression(text_train, label_train):
+    """Fit the TF-IDF and logistic regression pipeline on training data."""
+    model = make_pipeline(
+        TfidfVectorizer(min_df=TFIDF_MIN_DF, max_features=TFIDF_MAX_FEATURES),
+        LogisticRegression(solver="liblinear", max_iter=1000, random_state=SEED),
+    )
+    return model.fit(text_train, label_train)
+
+
+def log_mlflow_run(
+    name, model, scores, matrix, *, data_path: Path, dataset_sha256: str
+):
+    """Save one model's parameters, test results, and fitted pipeline in MLflow."""
+    tfidf = model[0]
+    classifier = model[-1]
+
+    mlflow.set_experiment(EXPERIMENT_NAME)
+    with mlflow.start_run(run_name=name):
+        mlflow.log_params(
+            {
+                "dataset": data_path.name,
+                "dataset_sha256": dataset_sha256,
+                "split": "stratified",
+                "test_size": TEST_SIZE,
+                "seed": SEED,
+                "tfidf.min_df": tfidf.min_df,
+                "tfidf.max_features": tfidf.max_features,
+                "classifier": type(classifier).__name__,
+                **{
+                    f"classifier.{key}": value
+                    for key, value in classifier.get_params(deep=False).items()
+                },
+            }
+        )
+        mlflow.log_metrics(scores)
+        mlflow.log_dict(
+            {"labels": [0, 1], "actual_by_predicted": matrix.tolist()},
+            "confusion_matrix.json",
+        )
+        mlflow.sklearn.log_model(model, name="pipeline")
+
+
 def compare_models(
     emails: pd.DataFrame, *, data_path: Path, baseline_only: bool = False
 ):
-    """Evaluate each model on the same split and record a separate MLflow run."""
+    """Evaluate the selected pipelines on one shared test split."""
     split, split_counts = split_dataset(emails)
     text_train, text_test, label_train, label_test = split
 
-    classifiers = {"Naive Bayes (baseline)": MultinomialNB()}
+    trainers = {"Naive Bayes (baseline)": train_naive_bayes}
     if not baseline_only:
-        classifiers["Logistic regression"] = LogisticRegression(
-            solver="liblinear", max_iter=1000, random_state=SEED
-        )
+        trainers["Logistic regression"] = train_logistic_regression
 
     with data_path.open("rb") as source:
         dataset_sha256 = file_digest(source, "sha256").hexdigest()
 
-    mlflow.set_experiment(EXPERIMENT_NAME)
     rows = []
+    for name, train_model in trainers.items():
+        model = train_model(text_train, label_train)
+        predicted = model.predict(text_test)
 
-    for name, classifier in classifiers.items():
-        tfidf = TfidfVectorizer(min_df=2, max_features=30_000)
-        model = make_pipeline(tfidf, classifier)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            label_test, predicted, average="binary", pos_label=1, zero_division=0
+        )
+        matrix = confusion_matrix(label_test, predicted, labels=[0, 1])
+        tn, fp, fn, tp = matrix.ravel()
 
-        with mlflow.start_run(run_name=name):
-            mlflow.log_params(
-                {
-                    "dataset": data_path.name,
-                    "dataset_sha256": dataset_sha256,
-                    "split": "stratified",
-                    "test_size": TEST_SIZE,
-                    "seed": SEED,
-                    "tfidf.min_df": tfidf.min_df,
-                    "tfidf.max_features": tfidf.max_features,
-                    "classifier": type(classifier).__name__,
-                    **{
-                        f"classifier.{key}": value
-                        for key, value in classifier.get_params(deep=False).items()
-                    },
-                }
-            )
-
-            model.fit(text_train, label_train)
-            predicted = model.predict(text_test)
-
-            precision, recall, f1, _ = precision_recall_fscore_support(
-                label_test, predicted, average="binary", pos_label=1, zero_division=0
-            )
-            matrix = confusion_matrix(label_test, predicted, labels=[0, 1])
-            tn, fp, fn, tp = matrix.ravel()
-
-            scores = {
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1": float(f1),
-                "true_negatives": int(tn),
-                "false_positives": int(fp),
-                "false_negatives": int(fn),
-                "true_positives": int(tp),
-            }
-
-            mlflow.log_metrics(scores)
-            mlflow.log_dict(
-                {"labels": [0, 1], "actual_by_predicted": matrix.tolist()},
-                "confusion_matrix.json",
-            )
-            mlflow.sklearn.log_model(model, name="pipeline")
-
+        scores = {
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "true_negatives": int(tn),
+            "false_positives": int(fp),
+            "false_negatives": int(fn),
+            "true_positives": int(tp),
+        }
+        log_mlflow_run(
+            name, model, scores, matrix, data_path=data_path, dataset_sha256=dataset_sha256
+        )
         rows.append({"model": name, **scores})
 
     return split_counts, pd.DataFrame(rows)

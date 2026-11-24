@@ -1,0 +1,23 @@
+artifact_path: file:C:/Users/htaya/aiops-phishing-detection/mlruns/1/models/m-f49b9abb0dd34d63b690ea90f8c9ac84/artifacts
+flavors:
+  python_function:
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.sklearn
+    model_path: model.skops
+    predict_fn: predict
+    python_version: 3.12.10
+  sklearn:
+    code: null
+    pickled_model: model.skops
+    serialization_format: skops
+    sklearn_version: 1.8.0
+    skops_trusted_types: null
+mlflow_version: 3.18.0
+model_id: m-f49b9abb0dd34d63b690ea90f8c9ac84
+model_size_bytes: 27556214
+model_uuid: m-f49b9abb0dd34d63b690ea90f8c9ac84
+prompts: null
+run_id: 5dfcd384ecc149688bbd9b0ca9183785
+utc_time_created: '2026-11-18 18:00:41.931580'
