@@ -1,5 +1,8 @@
 import argparse
+import gc
 import json
+import os
+import sys
 import re
 import shutil
 import time
@@ -37,6 +40,34 @@ SEED = 42
 TFIDF_MIN_DF = 2
 TFIDF_MAX_FEATURES = 30_000
 EXPERIMENT_NAME = "Spam and Phishing Email Detection"
+
+
+
+def load_env_file(path: Path):
+    """Read KEY=VALUE lines from .env into the environment (values already set win)."""
+    if not path.is_file():
+        return
+    for line in path.read_text("utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+# A shared MLflow server (for example DagsHub) is configured in the private file .env:
+# MLFLOW_TRACKING_URI, MLFLOW_TRACKING_USERNAME and MLFLOW_TRACKING_PASSWORD.
+# Without it, each computer keeps its own MLflow database in the project folder.
+load_env_file(ROOT / ".env")
+LOCAL_TRACKING_URI = f"sqlite:///{(ROOT / 'mlflow_local.db').as_posix()}"
+if not os.environ.get("MLFLOW_TRACKING_URI"):
+    mlflow.set_tracking_uri(LOCAL_TRACKING_URI)
+
+
+def tracking_location() -> str:
+    """Where the runs go, without user name or password."""
+    uri = mlflow.get_tracking_uri()
+    return "local database mlflow_local.db" if uri.startswith("sqlite") else uri
 
 
 def normalize_text(text: str) -> str:
@@ -211,6 +242,7 @@ MODELS = {
     "cascade": ("Cascade (LR -> DistilBERT)", train_cascade, ["torch", "transformers"]),
 }
 MODEL_ORDER = [name for name, _, _ in MODELS.values()]
+DEFAULT_MODELS = ["nb", "lr", "cnn", "bert"]  # the cascade only runs when asked for
 
 
 def check_packages(model_keys):
@@ -267,7 +299,9 @@ def model_params(model) -> dict:
     return model.params()
 
 
-def log_mlflow_run(name, model, scores, matrix, *, data_path: Path, dataset_sha256: str):
+def log_mlflow_run(
+    name, model, scores, matrix, *, data_path: Path, dataset_sha256: str, upload_model=True
+):
     """Save one model's parameters, test results, and fitted model in MLflow."""
     mlflow.set_experiment(EXPERIMENT_NAME)
     with mlflow.start_run(run_name=name):
@@ -288,10 +322,17 @@ def log_mlflow_run(name, model, scores, matrix, *, data_path: Path, dataset_sha2
             {"labels": [0, 1], "actual_by_predicted": matrix.tolist()},
             "confusion_matrix.json",
         )
-        if isinstance(model, Pipeline):
-            mlflow.sklearn.log_model(model, name="pipeline")
-        else:
-            model.log_to_mlflow(mlflow)
+        if not upload_model:
+            mlflow.set_tag("model_files", "kept locally in models/")
+            return
+        try:
+            if isinstance(model, Pipeline):
+                mlflow.sklearn.log_model(model, name="pipeline")
+            else:
+                model.log_to_mlflow(mlflow)
+        except Exception as error:  # noqa: BLE001 - keep the run even if the upload fails
+            mlflow.set_tag("model_files", "upload failed, kept locally in models/")
+            print(f"  Warning: model files were not uploaded to MLflow ({error}).")
 
 
 def save_model(key, model):
@@ -314,12 +355,28 @@ def save_model(key, model):
     print(f"  Saved to {folder.relative_to(ROOT)}")
 
 
+def free_gpu_memory():
+    """Release GPU memory of a finished model before the next one is trained."""
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def compare_models(
-    emails: pd.DataFrame, *, data_path: Path, model_keys, bert_train_limit=None, bert_max_tokens=256
+    emails: pd.DataFrame,
+    *,
+    data_path: Path,
+    model_keys,
+    bert_train_limit=None,
+    bert_max_tokens=256,
+    upload_models=True,
+    on_result=None,
 ):
     """Evaluate the selected models on one shared test split."""
     check_packages(model_keys)
     check_mlflow_artifacts()
+    print(f"MLflow runs go to: {tracking_location()}")
     split, split_counts = split_dataset(emails)
     text_train, text_test, label_train, label_test = split
 
@@ -364,11 +421,21 @@ def compare_models(
             "ms_per_email": round(1000 * predict_seconds / len(text_test), 3),
         }
         log_mlflow_run(
-            name, model, scores, matrix, data_path=data_path, dataset_sha256=dataset_sha256
+            name,
+            model,
+            scores,
+            matrix,
+            data_path=data_path,
+            dataset_sha256=dataset_sha256,
+            upload_model=upload_models,
         )
         save_model(key, model)
         rows.append({"model": name, **scores})
+        if on_result is not None:
+            on_result(pd.DataFrame(rows))  # keep finished results even if a later model fails
         print(f"Done: recall {recall:.4f}, F1 {f1:.4f} ({train_seconds / 60:.1f} min)\n")
+        del model
+        free_gpu_memory()
 
     return split_counts, pd.DataFrame(rows)
 
@@ -408,7 +475,7 @@ def main():
         "--models",
         nargs="+",
         choices=list(MODELS),
-        help="Models to train (default: all). Other rows in results/metrics.csv are kept.",
+        help="Models to train (default: nb lr cnn bert). Other rows in results/metrics.csv are kept.",
     )
     parser.add_argument(
         "--bert-train-limit",
@@ -423,6 +490,11 @@ def main():
         metavar="N",
         help="Tokens per email DistilBERT reads (default 256; 128 trains about twice as fast).",
     )
+    parser.add_argument(
+        "--skip-model-upload",
+        action="store_true",
+        help="Log parameters, metrics and the confusion matrix, but keep model files only in models/.",
+    )
     args = parser.parse_args()
     if not 16 <= args.bert_max_tokens <= 512:
         parser.error("--bert-max-tokens must be between 16 and 512.")
@@ -432,7 +504,7 @@ def main():
     if args.baseline_only:
         model_keys = ["nb"]
     else:
-        model_keys = list(dict.fromkeys(args.models or MODELS))
+        model_keys = list(dict.fromkeys(args.models or DEFAULT_MODELS))
 
     metrics_path = BASELINE_METRICS_PATH if args.baseline_only else METRICS_PATH
     if args.data.resolve() == metrics_path.resolve():
@@ -440,6 +512,15 @@ def main():
 
     try:
         emails, audit = load_dataset(args.data)
+
+        def write_metrics(new_rows):
+            table = new_rows if args.baseline_only else merge_metrics(new_rows, metrics_path)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with TemporaryDirectory(dir=metrics_path.parent) as temp_dir:
+                temp_metrics = Path(temp_dir) / metrics_path.name
+                table.to_csv(temp_metrics, index=False, float_format="%.6f")
+                temp_metrics.replace(metrics_path)
+            return table
 
         if args.split_only:
             _, split_counts = split_dataset(emails)
@@ -450,15 +531,10 @@ def main():
                 model_keys=model_keys,
                 bert_train_limit=args.bert_train_limit,
                 bert_max_tokens=args.bert_max_tokens,
+                upload_models=not args.skip_model_upload,
+                on_result=write_metrics,
             )
-            if not args.baseline_only:
-                metrics = merge_metrics(metrics, metrics_path)
-
-            metrics_path.parent.mkdir(parents=True, exist_ok=True)
-            with TemporaryDirectory(dir=metrics_path.parent) as temp_dir:
-                temp_metrics = Path(temp_dir) / metrics_path.name
-                metrics.to_csv(temp_metrics, index=False, float_format="%.6f")
-                temp_metrics.replace(metrics_path)
+            metrics = write_metrics(metrics)
 
     except (OSError, ValueError) as error:
         parser.exit(2, f"Error: {error}\n")
