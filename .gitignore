@@ -1,18 +1,21 @@
+# Python and Jupyter
 .venv/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 
+# Secrets (DagsHub token)
+.env
+
+# Data: keep only the placeholder
 /data/*
 !/data/.gitkeep
 
+# Trained models: stay on each computer
 /models/*
+!/models/.gitkeep
 !/models/models_example.txt
 
-.venv/
-__pycache__/
-data/*.csv
+# Local MLflow
 mlflow*.db
 mlruns/
-models/*
-!models/.gitkeep
