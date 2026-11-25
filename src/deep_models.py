@@ -208,21 +208,41 @@ class TextCNNClassifier:
         self.validation_f1 = best_f1
         return self
 
-    def _predict_ids(self, ids: np.ndarray) -> np.ndarray:
+    def _probabilities_from_ids(self, ids: np.ndarray) -> np.ndarray:
         torch = _torch()
         self.network.eval()
-        predictions = []
+        probabilities = []
         with torch.no_grad():
             for start in range(0, len(ids), PREDICT_BATCH_SIZE):
                 batch = torch.as_tensor(
                     ids[start : start + PREDICT_BATCH_SIZE], dtype=torch.long, device=self.device
                 )
-                # A logit above 0 means a probability above 0.5 for spam or phishing.
-                predictions.append((self.network(batch) > 0).long().cpu().numpy())
-        return np.concatenate(predictions)
+                probabilities.append(torch.sigmoid(self.network(batch)).float().cpu().numpy())
+        return np.concatenate(probabilities)
+
+    def _predict_ids(self, ids: np.ndarray) -> np.ndarray:
+        return (self._probabilities_from_ids(ids) >= 0.5).astype(np.int64)
+
+    def predict_proba(self, texts) -> np.ndarray:
+        """Probability of spam or phishing for each text."""
+        return self._probabilities_from_ids(self.tokenizer.encode(list(texts), CNN_MAX_TOKENS))
 
     def predict(self, texts) -> np.ndarray:
         return self._predict_ids(self.tokenizer.encode(list(texts), CNN_MAX_TOKENS))
+
+    @classmethod
+    def load(cls, folder: Path):
+        """Load a CNN saved with save()."""
+        torch = _torch()
+        folder = Path(folder)
+        model = cls(seed=0)
+        model.tokenizer = WordTokenizer(json.loads((folder / "vocabulary.json").read_text("utf-8")))
+        model.device = pick_device()
+        model.network = _build_text_cnn(model.tokenizer.size)
+        state = torch.load(folder / "text_cnn.pt", map_location=model.device, weights_only=True)
+        model.network.load_state_dict(state)
+        model.network.to(model.device).eval()
+        return model
 
     def params(self) -> dict:
         return {
@@ -364,25 +384,45 @@ class DistilBertClassifier:
         self.validation_f1 = best_f1
         return self
 
-    def predict(self, texts) -> np.ndarray:
+    def predict_proba(self, texts) -> np.ndarray:
+        """Probability of spam or phishing for each text."""
         torch = _torch()
         texts = list(texts)
         # Emails of similar length share a batch, so little padding is computed.
-        # The predictions are put back into the original order afterwards.
+        # The results are put back into the original order afterwards.
         order = np.argsort([len(text) for text in texts], kind="stable")
-        predictions = np.empty(len(texts), dtype=np.int64)
+        probabilities = np.empty(len(texts), dtype=np.float64)
         self.network.eval()
         started = time.perf_counter()
         with torch.no_grad(), self._autocast():
             for batch, start in enumerate(range(0, len(texts), PREDICT_BATCH_SIZE), start=1):
                 rows = order[start : start + PREDICT_BATCH_SIZE]
                 inputs = self._encode([texts[row] for row in rows])
-                predictions[rows] = self.network(**inputs).logits.argmax(dim=1).cpu().numpy()
+                logits = self.network(**inputs).logits.float()
+                probabilities[rows] = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
                 if batch % 50 == 0:
                     done = min(start + PREDICT_BATCH_SIZE, len(texts))
                     minutes = (time.perf_counter() - started) / 60
                     print(f"  DistilBERT predicting: {done:,}/{len(texts):,} emails ({minutes:.1f} min)")
-        return predictions
+        return probabilities
+
+    def predict(self, texts) -> np.ndarray:
+        return (self.predict_proba(texts) >= 0.5).astype(np.int64)
+
+    @classmethod
+    def load(cls, folder: Path):
+        """Load a DistilBERT saved with save()."""
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        folder = Path(folder)
+        settings = json.loads((folder / "serving.json").read_text("utf-8"))
+        model = cls(seed=0, max_tokens=settings["max_tokens"])
+        model.device = pick_device()
+        model.mixed_precision = model.device.type == "cuda"
+        model.tokenizer = AutoTokenizer.from_pretrained(folder)
+        model.network = AutoModelForSequenceClassification.from_pretrained(folder).to(model.device)
+        model.network.eval()
+        return model
 
     def params(self) -> dict:
         return {
@@ -407,6 +447,9 @@ class DistilBertClassifier:
     def save(self, folder: Path):
         self.network.save_pretrained(folder)
         self.tokenizer.save_pretrained(folder)
+        (Path(folder) / "serving.json").write_text(
+            json.dumps({"max_tokens": self.max_tokens}), "utf-8"
+        )
 
     def log_to_mlflow(self, mlflow):
         with TemporaryDirectory() as folder:

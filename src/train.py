@@ -1,4 +1,7 @@
 import argparse
+import json
+import re
+import shutil
 import time
 from hashlib import file_digest
 from importlib.util import find_spec
@@ -7,8 +10,10 @@ from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
+import joblib
 import mlflow
 import mlflow.sklearn
+import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -23,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data" / "phishing_email.csv"
 METRICS_PATH = ROOT / "results" / "metrics.csv"
 BASELINE_METRICS_PATH = ROOT / "results" / "baseline_metrics.csv"
+MODELS_DIR = ROOT / "models"
 
 TEXT = "text_combined"
 LABEL = "label"
@@ -31,6 +37,11 @@ SEED = 42
 TFIDF_MIN_DF = 2
 TFIDF_MAX_FEATURES = 30_000
 EXPERIMENT_NAME = "Spam and Phishing Email Detection"
+
+
+def normalize_text(text: str) -> str:
+    """The same cleaning as in load_dataset, for a single email at prediction time."""
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
 def load_dataset(path: Path):
@@ -133,12 +144,71 @@ def train_distilbert(text_train, label_train, *, bert_train_limit=None, bert_max
     ).fit(text_train, label_train)
 
 
+# A cascade sends only the emails logistic regression is unsure about to DistilBERT.
+CASCADE_LOW = 0.10   # probability of spam/phishing at or below this: legitimate, decided by LR
+CASCADE_HIGH = 0.90  # at or above this: spam/phishing, decided by LR; in between: DistilBERT
+
+
+class CascadeClassifier:
+    """Fast first check with logistic regression, DistilBERT only for unsure emails."""
+
+    def __init__(self, fast_model, slow_model, verbose=True):
+        self.fast_model = fast_model
+        self.slow_model = slow_model
+        self.verbose = verbose
+        self.share_to_slow = 0.0
+
+    def predict_proba(self, texts):
+        """Probability of spam or phishing; DistilBERT's for the unsure emails."""
+        texts = list(texts)
+        probability = self.fast_model.predict_proba(texts)[:, 1].astype(float)
+        unsure = np.flatnonzero((probability > CASCADE_LOW) & (probability < CASCADE_HIGH))
+        self.share_to_slow = len(unsure) / max(len(texts), 1)
+        if self.verbose:
+            print(
+                f"  Cascade: {len(unsure):,} of {len(texts):,} emails "
+                f"({self.share_to_slow:.1%}) go to DistilBERT"
+            )
+        if len(unsure):
+            probability[unsure] = self.slow_model.predict_proba([texts[index] for index in unsure])
+        return probability
+
+    def predict(self, texts):
+        return (self.predict_proba(texts) >= 0.5).astype(int)
+
+    def params(self) -> dict:
+        return {
+            "classifier": "Cascade: LogisticRegression -> DistilBERT",
+            "cascade.low": CASCADE_LOW,
+            "cascade.high": CASCADE_HIGH,
+            **{f"fast.{key}": value for key, value in model_params(self.fast_model).items()},
+            **{f"slow.{key}": value for key, value in self.slow_model.params().items()},
+        }
+
+    def extra_metrics(self) -> dict:
+        return {"share_to_distilbert": self.share_to_slow, **self.slow_model.extra_metrics()}
+
+    def log_to_mlflow(self, mlflow_module):
+        mlflow_module.sklearn.log_model(self.fast_model, name="fast_pipeline")
+        self.slow_model.log_to_mlflow(mlflow_module)
+
+
+def train_cascade(text_train, label_train, **options):
+    """Train logistic regression and DistilBERT on the same training data."""
+    print("  Cascade: training logistic regression")
+    fast = train_logistic_regression(text_train, label_train)
+    print("  Cascade: fine-tuning DistilBERT")
+    slow = train_distilbert(text_train, label_train, **options)
+    return CascadeClassifier(fast, slow)
+
+
 # Command-line key -> (name in results and MLflow, training function, extra packages)
 MODELS = {
     "nb": ("Naive Bayes (baseline)", train_naive_bayes, []),
     "lr": ("Logistic regression", train_logistic_regression, []),
     "cnn": ("CNN (word tokenizer)", train_cnn, ["torch"]),
     "bert": ("DistilBERT (fine-tuned)", train_distilbert, ["torch", "transformers"]),
+    "cascade": ("Cascade (LR -> DistilBERT)", train_cascade, ["torch", "transformers"]),
 }
 MODEL_ORDER = [name for name, _, _ in MODELS.values()]
 
@@ -224,6 +294,26 @@ def log_mlflow_run(name, model, scores, matrix, *, data_path: Path, dataset_sha2
             model.log_to_mlflow(mlflow)
 
 
+def save_model(key, model):
+    """Save a fitted model to models/<key>/ so that the API can load it later."""
+    folder = MODELS_DIR / key
+    if folder.exists():
+        shutil.rmtree(folder)
+    folder.mkdir(parents=True)
+    if isinstance(model, Pipeline):
+        joblib.dump(model, folder / "model.joblib")
+    elif isinstance(model, CascadeClassifier):
+        joblib.dump(model.fast_model, folder / "fast_model.joblib")
+        (folder / "distilbert").mkdir()
+        model.slow_model.save(folder / "distilbert")
+    else:
+        model.save(folder)
+    (folder / "model.json").write_text(
+        json.dumps({"key": key, "name": MODELS[key][0]}, indent=2), "utf-8"
+    )
+    print(f"  Saved to {folder.relative_to(ROOT)}")
+
+
 def compare_models(
     emails: pd.DataFrame, *, data_path: Path, model_keys, bert_train_limit=None, bert_max_tokens=256
 ):
@@ -270,10 +360,13 @@ def compare_models(
             "true_positives": int(tp),
             "train_seconds": round(train_seconds, 1),
             "predict_seconds": round(predict_seconds, 1),
+            "emails_per_second": round(len(text_test) / max(predict_seconds, 1e-9)),
+            "ms_per_email": round(1000 * predict_seconds / len(text_test), 3),
         }
         log_mlflow_run(
             name, model, scores, matrix, data_path=data_path, dataset_sha256=dataset_sha256
         )
+        save_model(key, model)
         rows.append({"model": name, **scores})
         print(f"Done: recall {recall:.4f}, F1 {f1:.4f} ({train_seconds / 60:.1f} min)\n")
 

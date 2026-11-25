@@ -1,6 +1,6 @@
 # Spam and Phishing Email Detection
 
-This AIOps project classifies email text as legitimate or suspicious. IT teams can use the result to decide which emails to flag for review. We compare four models on the same test split and record every run in MLflow:
+This AIOps project classifies email text as legitimate (0) or spam/phishing (1). IT security teams can use the result to decide which emails to deliver and which to flag for review. We compare four models on the same test split, record every run in MLflow and serve the chosen model through a FastAPI service.
 
 | Key    | Model                            | Idea                                                                      |
 | ------ | -------------------------------- | ------------------------------------------------------------------------- |
@@ -11,7 +11,9 @@ This AIOps project classifies email text as legitimate or suspicious. IT teams c
 
 The first three models learn only from our training emails. DistilBERT starts from a pretrained language model.
 
-A code-free explanation of the four algorithms with diagrams is in [docs/algorithms.md](docs/algorithms.md). The notebook [notebooks/01_phishing_detection.ipynb](notebooks/01_phishing_detection.ipynb) walks through the data, the models and the results.
+- A code-free explanation of the four algorithms with simple diagrams is in [docs/algorithms.md](docs/algorithms.md).
+- The notebook [notebooks/01_phishing_detection.ipynb](notebooks/01_phishing_detection.ipynb) walks through the data, the models and the results in VS Code.
+- The notebook [notebooks/01_phishing_detection_colab.ipynb](notebooks/01_phishing_detection_colab.ipynb) does the same in Google Colab without any local setup (see [Run in Google Colab](#run-in-google-colab)).
 
 ## Dataset
 
@@ -39,7 +41,22 @@ py -3.12 -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` includes `torch` and `transformers` for the CNN and DistilBERT, and `matplotlib` and `ipykernel` for the notebook. The first DistilBERT run downloads the pretrained model (about 270 MB) from Hugging Face.
+`requirements.txt` contains these packages:
+
+```text
+pandas
+scikit-learn
+mlflow
+joblib
+torch
+transformers
+matplotlib
+ipykernel
+fastapi
+uvicorn
+```
+
+`torch` and `transformers` are needed for the CNN and DistilBERT, `matplotlib` and `ipykernel` for the notebook, and `fastapi` and `uvicorn` for the API. The first DistilBERT run downloads the pretrained model (about 270 MB) from Hugging Face.
 
 ### Use an NVIDIA GPU
 
@@ -89,13 +106,14 @@ Each PC uses its own database file. A database copied from another computer stil
 
 ### Choose the models
 
-| Command                               | What it trains                                              |
-| ------------------------------------- | ----------------------------------------------------------- |
-| `python src/train.py`                 | All four models                                             |
-| `python src/train.py --models nb lr`  | Naive Bayes and logistic regression                         |
-| `python src/train.py --models cnn`    | Only the CNN                                                |
-| `python src/train.py --models bert`   | Only DistilBERT                                             |
-| `python src/train.py --baseline-only` | Only Naive Bayes, written to `results/baseline_metrics.csv` |
+| Command                                | What it trains                                                         |
+| -------------------------------------- | ---------------------------------------------------------------------- |
+| `python src/train.py`                  | All four models                                                        |
+| `python src/train.py --models nb lr`   | Naive Bayes and logistic regression                                    |
+| `python src/train.py --models cnn`     | Only the CNN                                                           |
+| `python src/train.py --models bert`    | Only DistilBERT                                                        |
+| `python src/train.py --models cascade` | Optional: logistic regression first, DistilBERT only for unsure emails |
+| `python src/train.py --baseline-only`  | Only Naive Bayes, written to `results/baseline_metrics.csv`            |
 
 Each trained model creates one MLflow run. `results/metrics.csv` keeps one row per model: a new run replaces that model's row and keeps the others. So you can train the slow models separately.
 
@@ -107,11 +125,61 @@ Import-Csv .\results\metrics.csv | Format-Table -AutoSize
 
 ### Runtime
 
-Naive Bayes and logistic regression train in seconds. The CNN needs about 7 minutes on a laptop CPU. DistilBERT needs a GPU: on a laptop CPU, 9,000 training emails already took about an hour. `train_seconds` in the results shows the real time.
+Naive Bayes and logistic regression train in seconds. The CNN needs about 7 minutes on a laptop CPU and about a minute on a GPU. DistilBERT needs a GPU: on an RTX 3050 laptop GPU it trains in about 7 minutes, while on a laptop CPU only 9,000 training emails already took about an hour. `train_seconds` in the results shows the real time.
+
+Our reference run for DistilBERT:
+
+```powershell
+python src/train.py --models bert --bert-max-tokens 128
+```
 
 To make DistilBERT faster, `--bert-max-tokens 128` reads only the first 128 tokens of each email instead of 256; this about halves the training time but the model sees less of each email.
 
 Without a GPU, `--bert-train-limit N` fine-tunes DistilBERT on a stratified sample of N training emails. The test set stays the same, but the model sees less data, so the comparison is not fair to it.
+
+### Optional: faster email checks with a cascade
+
+For a mail server, the time per email matters most. Every run therefore also records `emails_per_second` and `ms_per_email` for the test set.
+
+The cascade is implemented but not part of our reference results yet. It combines speed and quality: logistic regression checks every email in a fraction of a millisecond. Only the emails it is unsure about, with a spam probability between 10% and 90% (`CASCADE_LOW` and `CASCADE_HIGH` in `src/train.py`), go to DistilBERT. The run records which share of the emails went to DistilBERT as `share_to_distilbert`.
+
+```powershell
+python src/train.py --models cascade --bert-max-tokens 128
+```
+
+## Classify single emails instantly
+
+Every training run also saves the fitted model to `models/<key>/` (for example `models/bert/`). A saved model is loaded **once**; after that, each email only needs a prediction, which takes milliseconds. Each email is cleaned exactly like the training data (whitespace and lower case).
+
+Quick check in the terminal:
+
+```powershell
+python src/serving.py bert "URGENT: verify your account password here"
+```
+
+### FastAPI service
+
+The folder `app/` contains `main.py` and an empty `__init__.py`. Start the service from the project folder:
+
+```powershell
+python -m uvicorn app.main:app --port 8000
+```
+
+The terminal shows which model was loaded and whether it runs on the GPU (`cuda`) or the CPU.
+
+Open <http://127.0.0.1:8000/docs>, choose **POST /predict**, click **Try it out**, enter an email text and click **Execute**. The answer contains the label (0 legitimate, 1 spam or phishing), the spam probability, the model, the device and the prediction time in milliseconds. `GET /health` shows which model is loaded and on which device. An empty text returns an error (status 422).
+
+The service uses DistilBERT by default, because it has the best precision and F1. To use another saved model, set `PHISHING_MODEL` before starting it, for example `$env:PHISHING_MODEL = "lr"` in PowerShell or `set PHISHING_MODEL=lr` in cmd. Possible values: `nb`, `lr`, `cnn`, `bert`, `cascade`. The model must be trained first, so that it exists in `models/`.
+
+## Run in Google Colab
+
+The Colab notebook needs no local setup:
+
+1. Open <https://colab.research.google.com>, choose **File → Upload notebook** and select `notebooks/01_phishing_detection_colab.ipynb`.
+2. Choose **Runtime → Change runtime type → T4 GPU**.
+3. Choose **Runtime → Run all**.
+
+The first cells install MLflow, write the project code and the diagrams, and download the dataset from Kaggle. If the download does not work, an upload button appears for `phishing_email.csv`. All four models then train on the Colab GPU (about 10–15 minutes), and `results/metrics.csv` is downloaded at the end.
 
 ## View the runs in MLflow
 
@@ -174,20 +242,47 @@ The test set has 8,569 spam or phishing emails and 7,847 legitimate emails. On i
 
 DistilBERT makes the fewest errors overall (163 instead of 198 for the CNN and 232 for logistic regression) and flags the fewest legitimate emails (74). The CNN still misses the fewest spam or phishing emails (74 instead of 89), so it has the highest recall, our main metric. Both neural models train about 50 times longer than logistic regression, and DistilBERT needs a GPU and predicts about 15 times slower. Logistic regression is the easiest to explain, because each word has one weight.
 
+### Which model is best?
+
+- **Naive Bayes** is the weakest, because it looks at every word alone.
+- **Logistic regression** is much better, because it learns the weights of all words together. It is the fastest and easiest to explain.
+- **The CNN** finds the most spam (best recall), because it also sees the order of words in short phrases.
+- **DistilBERT** makes the fewest mistakes overall and has the fewest false alarms (best precision and F1), because it is pretrained on English text and reads every word in its context. It needs a GPU.
+
+The best choice depends on the goal: the CNN if catching as much phishing as possible matters most, DistilBERT for the fewest mistakes and false alarms, logistic regression if speed and explainability matter most. The API uses DistilBERT by default.
+
+### Limitations
+
 These results come from one split of a public dataset. Similar email templates can appear in both sets after exact duplicate removal. A company inbox can contain a different mix of emails. The models are still compared on the test set; the final model choice will also weigh runtime and explainability.
+
+## Project status
+
+| Milestone                                            | Date      | Status                                 |
+| ---------------------------------------------------- | --------- | -------------------------------------- |
+| Business problem                                     | 05 Nov    | Done                                   |
+| Repo, dataset, baseline and improved model           | 12–19 Nov | Done                                   |
+| MLflow tracking and further models (CNN, DistilBERT) | 26 Nov    | Done                                   |
+| Best model selection                                 | 03–10 Dec | Next step                              |
+| Model artifact and input/output schema               | 17 Dec    | Prepared (`models/`, `src/serving.py`) |
+| FastAPI deployment                                   | 07–14 Jan | Prepared (`app/main.py`)               |
+| Final presentation                                   | 21 Jan    | Planned                                |
 
 ## Project files
 
-| Path                                    | Purpose                                                             |
-| --------------------------------------- | ------------------------------------------------------------------- |
-| `src/train.py`                          | Data cleaning, splitting, training, evaluation, and MLflow tracking |
-| `src/deep_models.py`                    | Word tokenizer, CNN and DistilBERT fine-tuning                      |
-| `requirements.txt`                      | Python dependencies                                                 |
-| `data/phishing_email.csv`               | Email text and labels                                               |
-| `results/metrics.csv`                   | One row per trained model                                           |
-| `results/baseline_metrics.csv`          | Results generated by the baseline-only command                      |
-| `notebooks/01_phishing_detection.ipynb` | Walk-through of data, models, results and MLflow runs               |
-| `docs/algorithms.md` and `docs/img/`    | Code-free explanation of the four algorithms with diagrams          |
-| `mlflow_local.db` and `mlruns/`         | Local MLflow database and artifacts                                 |
+| Path                                          | Purpose                                                             |
+| --------------------------------------------- | ------------------------------------------------------------------- |
+| `src/train.py`                                | Data cleaning, splitting, training, evaluation, and MLflow tracking |
+| `src/deep_models.py`                          | Word tokenizer, CNN and DistilBERT fine-tuning                      |
+| `requirements.txt`                            | Python dependencies                                                 |
+| `data/phishing_email.csv`                     | Email text and labels                                               |
+| `results/metrics.csv`                         | One row per trained model                                           |
+| `results/baseline_metrics.csv`                | Results generated by the baseline-only command                      |
+| `models/<key>/`                               | Saved model of each trained model, loaded by the API                |
+| `src/serving.py`                              | Loads a saved model and classifies single emails                    |
+| `app/main.py` and `app/__init__.py`           | FastAPI service with `POST /predict` and `GET /health`              |
+| `notebooks/01_phishing_detection.ipynb`       | Walk-through of data, models, results and MLflow runs (VS Code)     |
+| `notebooks/01_phishing_detection_colab.ipynb` | The same walk-through for Google Colab, self-contained              |
+| `docs/algorithms.md` and `docs/img/`          | Code-free explanation of the four algorithms with simple diagrams   |
+| `mlflow_local.db` and `mlruns/`               | Local MLflow database and artifacts                                 |
 
 The dataset card asks users to cite Al-Subaiey et al. (2024), _Novel Interpretable and Robust Web-based AI Platform for Phishing Email Detection_. Paper
