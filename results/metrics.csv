@@ -1,3 +1,5 @@
-model,precision,recall,f1,true_negatives,false_positives,false_negatives,true_positives
-Naive Bayes (baseline),0.984104,0.968141,0.976057,7713,134,273,8296
-Logistic regression,0.982856,0.990197,0.986513,7699,148,84,8485
+model,precision,recall,f1,true_negatives,false_positives,false_negatives,true_positives,train_seconds,predict_seconds
+Naive Bayes (baseline),0.984104,0.968141,0.976057,7713,134,273,8296,7.300000,1.300000
+Logistic regression,0.982856,0.990197,0.986513,7699,148,84,8485,8.500000,1.400000
+CNN (word tokenizer),0.985613,0.991364,0.988480,7723,124,74,8495,420.700000,7.000000
+DistilBERT (fine-tuned),0.991349,0.989614,0.990481,7773,74,89,8480,430.400000,20.800000

@@ -8,3 +8,11 @@ __pycache__/
 
 /models/*
 !/models/models_example.txt
+
+.venv/
+__pycache__/
+data/*.csv
+mlflow*.db
+mlruns/
+models/*
+!models/.gitkeep
